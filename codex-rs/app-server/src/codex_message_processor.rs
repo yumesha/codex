@@ -2321,7 +2321,7 @@ impl CodexMessageProcessor {
             timeout_secs,
         } = params;
 
-        let Some(server) = config.mcp_servers.get(&name) else {
+        let Some(server) = config.mcp_servers.get().get(&name) else {
             let error = JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!("No MCP server named '{name}' found."),

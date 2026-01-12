@@ -26,6 +26,7 @@ use toml::Value as TomlValue;
 
 pub use config_requirements::ConfigRequirements;
 pub use config_requirements::ConfigRequirementsToml;
+pub use config_requirements::McpServerIdentityRequirement;
 pub use config_requirements::RequirementSource;
 pub use config_requirements::SandboxModeRequirement;
 pub use merge::merge_toml_values;

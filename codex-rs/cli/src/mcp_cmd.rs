@@ -331,7 +331,7 @@ async fn run_login(config_overrides: &CliConfigOverrides, login_args: LoginArgs)
 
     let LoginArgs { name, scopes } = login_args;
 
-    let Some(server) = config.mcp_servers.get(&name) else {
+    let Some(server) = config.mcp_servers.get().get(&name) else {
         bail!("No MCP server named '{name}' found.");
     };
 
@@ -370,6 +370,7 @@ async fn run_logout(config_overrides: &CliConfigOverrides, logout_args: LogoutAr
 
     let server = config
         .mcp_servers
+        .get()
         .get(&name)
         .ok_or_else(|| anyhow!("No MCP server named '{name}' found in configuration."))?;
 
@@ -652,7 +653,7 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
         .await
         .context("failed to load configuration")?;
 
-    let Some(server) = config.mcp_servers.get(&get_args.name) else {
+    let Some(server) = config.mcp_servers.get().get(&get_args.name) else {
         bail!("No MCP server named '{name}' found.", name = get_args.name);
     };
 

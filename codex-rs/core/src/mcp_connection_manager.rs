@@ -62,6 +62,7 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::codex::INITIAL_SUBMIT_ID;
+use crate::config::Constrained;
 use crate::config::types::McpServerConfig;
 use crate::config::types::McpServerTransportConfig;
 
@@ -312,7 +313,7 @@ pub(crate) struct McpConnectionManager {
 impl McpConnectionManager {
     pub async fn initialize(
         &mut self,
-        mcp_servers: HashMap<String, McpServerConfig>,
+        mcp_servers: &Constrained<HashMap<String, McpServerConfig>>,
         store_mode: OAuthCredentialsStoreMode,
         auth_entries: HashMap<String, McpAuthStatusEntry>,
         tx_event: Sender<Event>,
@@ -325,6 +326,7 @@ impl McpConnectionManager {
         let mut clients = HashMap::new();
         let mut join_set = JoinSet::new();
         let elicitation_requests = ElicitationRequestManager::default();
+        let mcp_servers = mcp_servers.get().clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
             let cancel_token = cancel_token.child_token();
             let _ = emit_update(

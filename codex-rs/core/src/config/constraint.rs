@@ -37,11 +37,13 @@ impl From<ConstraintError> for std::io::Error {
 }
 
 type ConstraintValidator<T> = dyn Fn(&T) -> ConstraintResult<()> + Send + Sync;
+type ConstraintNormalizer<T> = dyn Fn(T) -> T + Send + Sync;
 
 #[derive(Clone)]
 pub struct Constrained<T> {
     value: T,
     validator: Arc<ConstraintValidator<T>>,
+    normalizer: Option<Arc<ConstraintNormalizer<T>>>,
 }
 
 impl<T: Send + Sync> Constrained<T> {
@@ -54,6 +56,22 @@ impl<T: Send + Sync> Constrained<T> {
         Ok(Self {
             value: initial_value,
             validator,
+            normalizer: None,
+        })
+    }
+
+    pub fn normalized(
+        initial_value: T,
+        normalizer: impl Fn(T) -> T + Send + Sync + 'static,
+    ) -> ConstraintResult<Self> {
+        let validator: Arc<ConstraintValidator<T>> = Arc::new(|_| Ok(()));
+        let normalizer: Arc<ConstraintNormalizer<T>> = Arc::new(normalizer);
+        let normalized = normalizer(initial_value);
+        validator(&normalized)?;
+        Ok(Self {
+            value: normalized,
+            validator,
+            normalizer: Some(normalizer),
         })
     }
 
@@ -61,6 +79,7 @@ impl<T: Send + Sync> Constrained<T> {
         Self {
             value: initial_value,
             validator: Arc::new(|_| Ok(())),
+            normalizer: None,
         }
     }
 
@@ -88,6 +107,11 @@ impl<T: Send + Sync> Constrained<T> {
     }
 
     pub fn set(&mut self, value: T) -> ConstraintResult<()> {
+        let value = if let Some(normalizer) = &self.normalizer {
+            normalizer(value)
+        } else {
+            value
+        };
         (self.validator)(&value)?;
         self.value = value;
         Ok(())
@@ -141,6 +165,17 @@ mod tests {
     fn constrained_allow_any_default_uses_default_value() {
         let constrained = Constrained::<i32>::allow_any_from_default();
         assert_eq!(constrained.value(), 0);
+    }
+
+    #[test]
+    fn constrained_normalizer_applies_on_init_and_set() -> anyhow::Result<()> {
+        let mut constrained = Constrained::normalized(-1, |value| value.max(0))?;
+        assert_eq!(constrained.value(), 0);
+        constrained.set(-5)?;
+        assert_eq!(constrained.value(), 0);
+        constrained.set(10)?;
+        assert_eq!(constrained.value(), 10);
+        Ok(())
     }
 
     #[test]

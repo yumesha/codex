@@ -747,7 +747,7 @@ impl Session {
             .write()
             .await
             .initialize(
-                config.mcp_servers.clone(),
+                &config.mcp_servers,
                 config.mcp_oauth_credentials_store_mode,
                 auth_statuses.clone(),
                 tx_event.clone(),
