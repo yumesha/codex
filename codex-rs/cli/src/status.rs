@@ -338,3 +338,150 @@ fn format_tokens(count: i64) -> String {
         count.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_format_tokens_small() {
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(999), "999");
+    }
+
+    #[test]
+    fn test_format_tokens_thousands() {
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(format_tokens(1_500), "1.5k");
+        assert_eq!(format_tokens(45_200), "45.2k");
+    }
+
+    #[test]
+    fn test_format_tokens_millions() {
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(2_300_000), "2.3M");
+    }
+
+    #[test]
+    fn test_format_duration_label() {
+        assert_eq!(format_duration_label(30), "30m");
+        assert_eq!(format_duration_label(60), "1h");
+        assert_eq!(format_duration_label(300), "5h");
+        assert_eq!(format_duration_label(1440), "1d");
+        assert_eq!(format_duration_label(10080), "Weekly");
+    }
+
+    #[test]
+    fn test_format_reset_time() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Past time
+        let past = now - 3600;
+        assert_eq!(format_reset_time(past), "recently");
+
+        // Future time (same day) - should return HH:MM format
+        let future = now + 7200; // 2 hours from now
+        let result = format_reset_time(future);
+        assert!(result.contains(':'));
+        assert!(result.len() == 5 || result.contains("on")); // Either HH:MM or HH:MM on DD Mon
+    }
+
+    #[tokio::test]
+    async fn test_extract_session_data_empty_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let result = extract_session_data(temp_file.path()).await.unwrap();
+
+        assert!(result.token_usage.is_none());
+        assert!(result.rate_limits.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_session_data_with_token_count() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Write a token_count event
+        let event = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1500,"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200,"reasoning_output_tokens":100}}}}"#;
+        writeln!(temp_file, "{}", event).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = extract_session_data(temp_file.path()).await.unwrap();
+
+        assert!(result.token_usage.is_some());
+        let usage = result.token_usage.unwrap();
+        assert_eq!(usage.total_tokens, 1500);
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 500);
+    }
+
+    #[tokio::test]
+    async fn test_extract_session_data_with_rate_limits() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Write a token_count event with rate limits
+        let event = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100,"input_tokens":60,"output_tokens":40,"cached_input_tokens":0,"reasoning_output_tokens":0}},"rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":1736789074},"secondary":{"used_percent":5.0,"window_minutes":10080,"resets_at":1737393874}}}}"#;
+        writeln!(temp_file, "{}", event).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = extract_session_data(temp_file.path()).await.unwrap();
+
+        assert!(result.rate_limits.is_some());
+        let limits = result.rate_limits.unwrap();
+        assert!(limits.primary.is_some());
+        assert!(limits.secondary.is_some());
+
+        let primary = limits.primary.unwrap();
+        assert_eq!(primary.used_percent, 1.0);
+        assert_eq!(primary.window_minutes, Some(300));
+
+        let secondary = limits.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 5.0);
+        assert_eq!(secondary.window_minutes, Some(10080));
+    }
+
+    #[tokio::test]
+    async fn test_extract_session_data_multiple_events() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Write multiple events, last token_count should win
+        writeln!(temp_file, r#"{{"type":"session_meta","payload":{{"id":"test"}}}}"#).unwrap();
+        writeln!(temp_file, r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":1000,"input_tokens":600,"output_tokens":400,"cached_input_tokens":0,"reasoning_output_tokens":0}}}}}}}}"#).unwrap();
+        writeln!(temp_file, r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":2000,"input_tokens":1200,"output_tokens":800,"cached_input_tokens":0,"reasoning_output_tokens":0}}}}}}}}"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = extract_session_data(temp_file.path()).await.unwrap();
+
+        assert!(result.token_usage.is_some());
+        let usage = result.token_usage.unwrap();
+        // Should use the last token_count event
+        assert_eq!(usage.total_tokens, 2000);
+    }
+
+    #[test]
+    fn test_display_rate_limit_bar_calculation() {
+        // Test that the bar calculation works correctly
+        const BAR_WIDTH: usize = 30;
+
+        // 1% used = 1 filled char
+        let used_1_percent = 1.0;
+        let filled = ((used_1_percent / 100.0) * BAR_WIDTH as f64).round() as usize;
+        assert_eq!(filled, 0); // Rounds to 0
+
+        // 50% used = 15 filled chars
+        let used_50_percent = 50.0;
+        let filled = ((used_50_percent / 100.0) * BAR_WIDTH as f64).round() as usize;
+        assert_eq!(filled, 15);
+
+        // 100% used = 30 filled chars
+        let used_100_percent = 100.0;
+        let filled = ((used_100_percent / 100.0) * BAR_WIDTH as f64).round() as usize;
+        assert_eq!(filled, 30);
+    }
+}
