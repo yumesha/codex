@@ -3313,6 +3313,8 @@ impl CodexMessageProcessor {
                 id: turn_id.clone(),
                 content: vec![V2UserInput::Text {
                     text: display_text.to_string(),
+                    // Review prompt display text is synthesized; no UI element ranges to preserve.
+                    text_elements: Vec::new(),
                 }],
             }]
         };
