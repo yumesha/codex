@@ -15,6 +15,7 @@ use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
 use codex_cli::login::run_logout;
+use codex_cli::status::run_status;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
 use codex_exec::Cli as ExecCli;
@@ -92,6 +93,9 @@ enum Subcommand {
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
+
+    /// Show current session configuration and token usage.
+    Status(StatusCommand),
 
     /// [experimental] Run Codex as an MCP server and manage MCP servers.
     Mcp(McpCli),
@@ -296,6 +300,12 @@ enum LoginSubcommand {
 
 #[derive(Debug, Parser)]
 struct LogoutCommand {
+    #[clap(skip)]
+    config_overrides: CliConfigOverrides,
+}
+
+#[derive(Debug, Parser)]
+struct StatusCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 }
@@ -699,6 +709,13 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
             );
             run_logout(logout_cli.config_overrides).await;
+        }
+        Some(Subcommand::Status(mut status_cli)) => {
+            prepend_config_flags(
+                &mut status_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_status(status_cli.config_overrides).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
