@@ -51,7 +51,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.80.1"
+version = "0.80.3-custom"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -142,10 +142,10 @@ icu_decimal = "2.1"
 icu_locale_core = "2.1"
 icu_provider = { version = "2.1", features = ["sync"] }
 ignore = "0.4.23"
-indoc = "2.0"
 image = { version = "^0.25.9", default-features = false }
 include_dir = "0.7.4"
 indexmap = "2.12.0"
+indoc = "2.0"
 insta = "1.46.0"
 itertools = "0.14.0"
 keyring = { version = "3.6", default-features = false }
@@ -166,7 +166,6 @@ opentelemetry-appender-tracing = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
 opentelemetry_sdk = "0.31.0"
-tracing-opentelemetry = "0.32.0"
 os_info = "3.12.0"
 owo-colors = "4.2.0"
 path-absolutize = "3.1.1"
@@ -216,11 +215,11 @@ toml = "0.9.5"
 toml_edit = "0.24.0"
 tracing = "0.1.43"
 tracing-appender = "0.2.3"
+tracing-opentelemetry = "0.32.0"
 tracing-subscriber = "0.3.22"
 tracing-test = "0.2.5"
 tree-sitter = "0.25.10"
 tree-sitter-bash = "0.25"
-zstd = "0.13"
 tree-sitter-highlight = "0.25.10"
 ts-rs = "11"
 tui-scrollbar = "0.2.2"
@@ -235,6 +234,7 @@ walkdir = "2.5.0"
 webbrowser = "1.0"
 which = "8"
 wildmatch = "2.6.1"
+zstd = "0.13"
 
 wiremock = "0.6"
 zeroize = "1.8.2"
