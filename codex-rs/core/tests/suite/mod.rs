@@ -117,6 +117,7 @@ mod text_encoding_fix;
 mod tool_harness;
 mod tool_parallelism;
 mod tools;
+mod transcribe_media;
 mod truncation;
 mod turn_state;
 mod undo;

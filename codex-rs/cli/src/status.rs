@@ -1,9 +1,16 @@
 use codex_backend_client::Client as BackendClient;
-use codex_common::{CliConfigOverrides, create_config_summary_entries};
+use codex_common::CliConfigOverrides;
+use codex_common::create_config_summary_entries;
+use codex_core::CodexAuth;
+use codex_core::INTERACTIVE_SESSION_SOURCES;
+use codex_core::RolloutRecorder;
+use codex_core::ThreadSortKey;
 use codex_core::config::Config;
 use codex_core::project_doc::discover_project_doc_paths;
-use codex_core::protocol::{NetworkAccess, RateLimitSnapshot, SandboxPolicy, TokenUsage};
-use codex_core::{CodexAuth, INTERACTIVE_SESSION_SOURCES, RolloutRecorder, ThreadSortKey};
+use codex_core::protocol::NetworkAccess;
+use codex_core::protocol::RateLimitSnapshot;
+use codex_core::protocol::SandboxPolicy;
+use codex_core::protocol::TokenUsage;
 use std::path::Path;
 
 const CODEX_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -305,7 +312,8 @@ struct SessionData {
 }
 
 async fn extract_session_data(session_path: &std::path::Path) -> std::io::Result<SessionData> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::BufReader;
 
     let file = tokio::fs::File::open(session_path).await?;
     let reader = BufReader::new(file);
@@ -436,7 +444,8 @@ fn format_duration_label(minutes: i64) -> String {
 }
 
 fn format_reset_time(unix_timestamp: i64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -502,7 +511,8 @@ mod tests {
 
     #[test]
     fn test_format_reset_time() {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

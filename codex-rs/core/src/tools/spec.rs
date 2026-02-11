@@ -449,6 +449,67 @@ fn create_view_image_tool() -> ToolSpec {
     })
 }
 
+fn create_transcribe_media_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "path".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Local filesystem path to an audio or video file to transcribe.".to_string(),
+                ),
+            },
+        ),
+        (
+            "model".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional transcription model override. Defaults to gpt-4o-mini-transcribe."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "language".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional language hint (ISO-639-1, for example \"en\").".to_string(),
+                ),
+            },
+        ),
+        (
+            "prompt".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional transcript style prompt to steer punctuation or formatting."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "temperature".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional sampling temperature. Lower values are more deterministic."
+                        .to_string(),
+                ),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "transcribe_media".to_string(),
+        description:
+            "Transcribe spoken content from a local audio or video file and return plain text."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_spawn_agent_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -1287,6 +1348,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
     use crate::tools::handlers::TestSyncHandler;
+    use crate::tools::handlers::TranscribeMediaHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
     use std::sync::Arc;
@@ -1300,6 +1362,7 @@ pub(crate) fn build_specs(
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let get_memory_handler = Arc::new(GetMemoryHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
+    let transcribe_media_handler = Arc::new(TranscribeMediaHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler);
@@ -1428,6 +1491,8 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
+    builder.push_spec_with_parallel_support(create_transcribe_media_tool(), true);
+    builder.register_handler("transcribe_media", transcribe_media_handler);
 
     if config.collab_tools {
         let collab_handler = Arc::new(CollabHandler);
@@ -1661,6 +1726,7 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
+            create_transcribe_media_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -1855,6 +1921,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -1877,6 +1944,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -1901,6 +1969,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -1925,6 +1994,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -1946,6 +2016,7 @@ mod tests {
                 "request_user_input",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -1968,6 +2039,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -1989,6 +2061,7 @@ mod tests {
                 "request_user_input",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -2011,6 +2084,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -2034,6 +2108,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }
@@ -2057,6 +2132,7 @@ mod tests {
                 "request_user_input",
                 "web_search",
                 "view_image",
+                "transcribe_media",
             ],
         );
     }

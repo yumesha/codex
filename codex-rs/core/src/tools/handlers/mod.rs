@@ -11,6 +11,7 @@ mod read_file;
 mod request_user_input;
 mod shell;
 mod test_sync;
+mod transcribe_media;
 mod unified_exec;
 mod view_image;
 
@@ -33,6 +34,7 @@ pub(crate) use request_user_input::request_user_input_tool_description;
 pub use shell::ShellCommandHandler;
 pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;
+pub use transcribe_media::TranscribeMediaHandler;
 pub use unified_exec::UnifiedExecHandler;
 pub use view_image::ViewImageHandler;
 
