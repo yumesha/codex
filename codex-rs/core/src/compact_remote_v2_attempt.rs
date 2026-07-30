@@ -106,13 +106,22 @@ pub(super) async fn run_remote_compact_v2_attempt(
     trace_attempt.record_result(
         compaction_output_result
             .as_ref()
-            .map(|output| std::slice::from_ref(&output.compaction_output)),
+            .map(|output| output.output_items.as_slice()),
     );
     let RemoteCompactionV2Output {
-        compaction_output,
+        mut output_items,
+        compaction_index,
         response_id,
         token_usage,
     } = compaction_output_result?;
+    for reasoning_item in output_items
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+    {
+        sess.send_raw_response_items(turn_context, std::slice::from_ref(reasoning_item))
+            .await;
+    }
+    let compaction_output = output_items.swap_remove(compaction_index);
     // TODO: Emit this before compaction output validation so malformed completed
     // responses still surface their raw upstream usage.
     sess.send_event(

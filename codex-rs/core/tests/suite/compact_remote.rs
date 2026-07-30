@@ -27,6 +27,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::ConversationStartParams;
@@ -70,6 +71,15 @@ use wiremock::matchers::path_regex;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 const TEST_WAV_SAMPLE_RATE: u32 = 8_000;
+
+#[derive(Debug, PartialEq)]
+enum ObservedCompactionRawEvent {
+    CompactionStarted,
+    Reasoning(Vec<ReasoningItemReasoningSummary>),
+    Other(Box<ResponseItem>),
+    Completed { response_id: String },
+    CompactionCompleted,
+}
 
 fn pcm_wav_data_url(sample_count: u32) -> String {
     let padding = sample_count % 2;
@@ -350,6 +360,41 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
         REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT,
     )
     .await;
+}
+
+async fn wait_for_compaction_raw_events(
+    codex: &codex_core::CodexThread,
+) -> Vec<ObservedCompactionRawEvent> {
+    let mut events = Vec::new();
+    loop {
+        let event =
+            wait_for_event_with_timeout(codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
+                .await;
+        match event {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::ContextCompaction(_),
+                ..
+            }) => events.push(ObservedCompactionRawEvent::CompactionStarted),
+            EventMsg::RawResponseItem(raw) => match raw.item {
+                ResponseItem::Reasoning { summary, .. } => {
+                    events.push(ObservedCompactionRawEvent::Reasoning(summary));
+                }
+                item => events.push(ObservedCompactionRawEvent::Other(Box::new(item))),
+            },
+            EventMsg::RawResponseCompleted(completed) => {
+                events.push(ObservedCompactionRawEvent::Completed {
+                    response_id: completed.response_id,
+                });
+            }
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::ContextCompaction(_),
+                ..
+            }) => events.push(ObservedCompactionRawEvent::CompactionCompleted),
+            EventMsg::TurnComplete(_) => return events,
+            EventMsg::Error(error) => panic!("compaction failed: {}", error.message),
+            _ => {}
+        }
+    }
 }
 
 async fn submit_text(codex: &codex_core::CodexThread, text: &str) -> Result<()> {
@@ -1279,6 +1324,9 @@ async fn remote_compact_v2_bounds_a_tokenizer_dense_retained_suffix() -> Result<
 async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const FAILED_LOCAL_REASONING: &str = "FAILED_LOCAL_COMPACTION_REASONING";
+    const RETRIED_LOCAL_REASONING: &str = "RETRIED_LOCAL_COMPACTION_REASONING";
+
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -1299,14 +1347,18 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
                 responses::ev_completed("resp-1"),
             ])),
             ResponseTemplate::new(500).set_body_string("first compact open failed"),
-            responses::sse_response(responses::sse(vec![serde_json::json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "compaction",
-                    "encrypted_content": "FAILED_COMPACT_SUMMARY",
-                }
-            })])),
             responses::sse_response(responses::sse(vec![
+                responses::ev_reasoning_item("rs-failed", &[FAILED_LOCAL_REASONING], &[]),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "FAILED_COMPACT_SUMMARY",
+                    }
+                }),
+            ])),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_reasoning_item("rs-retried", &[RETRIED_LOCAL_REASONING], &[]),
                 serde_json::json!({
                     "type": "response.output_item.done",
                     "item": {
@@ -1339,7 +1391,21 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
     wait_for_turn_complete(&codex).await;
 
     codex.submit(Op::Compact).await?;
-    wait_for_turn_complete(&codex).await;
+    assert_eq!(
+        wait_for_compaction_raw_events(&codex).await,
+        vec![
+            ObservedCompactionRawEvent::CompactionStarted,
+            ObservedCompactionRawEvent::Reasoning(vec![
+                ReasoningItemReasoningSummary::SummaryText {
+                    text: RETRIED_LOCAL_REASONING.to_string(),
+                },
+            ]),
+            ObservedCompactionRawEvent::Completed {
+                response_id: "resp-compact-retry".to_string(),
+            },
+            ObservedCompactionRawEvent::CompactionCompleted,
+        ]
+    );
 
     codex
         .submit(Op::UserInput {
@@ -1391,6 +1457,8 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
 async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const LOCAL_REASONING_SUMMARY: &str = "LOCAL_ONLY_COMPACTION_REASONING";
+
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -1409,6 +1477,7 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
                 responses::ev_completed("resp-1"),
             ]),
             responses::sse(vec![
+                responses::ev_reasoning_item("rs-compact", &[LOCAL_REASONING_SUMMARY], &[]),
                 responses::ev_assistant_message("m-compact-noise", "IGNORED_COMPACT_REPLY"),
                 serde_json::json!({
                     "type": "response.output_item.done",
@@ -1442,7 +1511,21 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
     wait_for_turn_complete(&codex).await;
 
     codex.submit(Op::Compact).await?;
-    wait_for_turn_complete(&codex).await;
+    assert_eq!(
+        wait_for_compaction_raw_events(&codex).await,
+        vec![
+            ObservedCompactionRawEvent::CompactionStarted,
+            ObservedCompactionRawEvent::Reasoning(vec![
+                ReasoningItemReasoningSummary::SummaryText {
+                    text: LOCAL_REASONING_SUMMARY.to_string(),
+                },
+            ]),
+            ObservedCompactionRawEvent::Completed {
+                response_id: "resp-compact".to_string(),
+            },
+            ObservedCompactionRawEvent::CompactionCompleted,
+        ]
+    );
 
     codex
         .submit(Op::UserInput {
@@ -1472,6 +1555,10 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
     assert!(
         !follow_up_body.contains("IGNORED_COMPACT_REPLY"),
         "expected follow-up request to ignore unrelated output items from the compaction stream"
+    );
+    assert!(
+        !follow_up_body.contains(LOCAL_REASONING_SUMMARY),
+        "expected follow-up request to exclude the locally emitted compaction reasoning summary"
     );
 
     Ok(())

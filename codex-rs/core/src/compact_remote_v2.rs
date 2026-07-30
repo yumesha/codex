@@ -58,6 +58,8 @@ use retention::truncate_message_to_retention_budget;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
+const MAX_REMOTE_COMPACTION_V2_AUXILIARY_ITEMS: usize = 128;
+const MAX_REMOTE_COMPACTION_V2_AUXILIARY_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -323,7 +325,8 @@ async fn run_remote_compact_task_inner_impl(
 }
 
 struct RemoteCompactionV2Output {
-    compaction_output: ResponseItem,
+    output_items: Vec<ResponseItem>,
+    compaction_index: usize,
     response_id: String,
     token_usage: Option<TokenUsage>,
 }
@@ -383,7 +386,10 @@ async fn collect_compaction_output(
 ) -> CodexResult<RemoteCompactionV2Output> {
     let mut output_item_count = 0usize;
     let mut compaction_count = 0usize;
-    let mut compaction_output = None;
+    let mut auxiliary_item_count = 0usize;
+    let mut auxiliary_bytes = 0usize;
+    let mut output_items = Vec::new();
+    let mut compaction_index = None;
     let mut saw_completed = false;
     let mut completed_response_id = None;
     let mut completed_token_usage = None;
@@ -391,12 +397,38 @@ async fn collect_compaction_output(
         match event? {
             ResponseEvent::OutputItemDone(item) => {
                 output_item_count += 1;
-                if let ResponseItem::Compaction { .. } = item {
+                if matches!(&item, ResponseItem::Compaction { .. }) {
                     compaction_count += 1;
-                    if compaction_output.is_none() {
-                        compaction_output = Some(item);
+                    if compaction_count > 1 {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote compaction v2 expected exactly one compaction output item, got at least {compaction_count} from {output_item_count} output items"
+                        )));
+                    }
+                    if compaction_index.is_none() {
+                        compaction_index = Some(output_items.len());
+                    }
+                } else {
+                    auxiliary_item_count += 1;
+                    if auxiliary_item_count > MAX_REMOTE_COMPACTION_V2_AUXILIARY_ITEMS {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote compaction v2 auxiliary output exceeded the {MAX_REMOTE_COMPACTION_V2_AUXILIARY_ITEMS}-item limit"
+                        )));
+                    }
+                    let serialized_bytes = serde_json::to_vec(&item)
+                        .map_err(|err| {
+                            CodexErr::Fatal(format!(
+                                "failed to serialize remote compaction v2 auxiliary output: {err}"
+                            ))
+                        })?
+                        .len();
+                    auxiliary_bytes = auxiliary_bytes.saturating_add(serialized_bytes);
+                    if auxiliary_bytes > MAX_REMOTE_COMPACTION_V2_AUXILIARY_BYTES {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote compaction v2 auxiliary output exceeded the {MAX_REMOTE_COMPACTION_V2_AUXILIARY_BYTES}-byte limit"
+                        )));
                     }
                 }
+                output_items.push(item);
             }
             ResponseEvent::Completed {
                 response_id,
@@ -424,14 +456,15 @@ async fn collect_compaction_output(
         )));
     }
 
-    let Some(compaction_output) = compaction_output else {
+    let Some(compaction_index) = compaction_index else {
         unreachable!("compaction output must exist when count is exactly one");
     };
     let Some(response_id) = completed_response_id else {
         unreachable!("response id must exist after response.completed");
     };
     Ok(RemoteCompactionV2Output {
-        compaction_output,
+        output_items,
+        compaction_index,
         response_id,
         token_usage: completed_token_usage,
     })
@@ -511,6 +544,7 @@ mod tests {
     use crate::context_manager::estimate_item_token_count;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::MessagePhase;
+    use codex_protocol::models::ReasoningItemReasoningSummary;
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -869,17 +903,28 @@ mod tests {
 
     #[tokio::test]
     async fn collect_compaction_output_accepts_additional_output_items() {
+        let reasoning = ResponseItem::Reasoning {
+            id: None,
+            summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                text: "LOCAL_ONLY_COMPACTION_REASONING".to_string(),
+            }],
+            content: None,
+            encrypted_content: Some("encrypted-reasoning".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let ignored_message = message(
+            "assistant",
+            "IGNORED_COMPACT_REPLY",
+            Some(MessagePhase::FinalAnswer),
+        );
         let compaction = ResponseItem::Compaction {
             id: None,
             encrypted_content: "encrypted".to_string(),
             internal_chat_message_metadata_passthrough: None,
         };
         let stream = response_stream(vec![
-            Ok(ResponseEvent::OutputItemDone(message(
-                "assistant",
-                "IGNORED_COMPACT_REPLY",
-                Some(MessagePhase::FinalAnswer),
-            ))),
+            Ok(ResponseEvent::OutputItemDone(reasoning.clone())),
+            Ok(ResponseEvent::OutputItemDone(ignored_message.clone())),
             Ok(ResponseEvent::OutputItemDone(compaction.clone())),
             Ok(ResponseEvent::Completed {
                 response_id: "resp-compact".to_string(),
@@ -899,7 +944,11 @@ mod tests {
             .await
             .expect("compaction should be collected");
 
-        assert_eq!(output.compaction_output, compaction);
+        assert_eq!(
+            output.output_items,
+            vec![reasoning, ignored_message, compaction]
+        );
+        assert_eq!(output.compaction_index, 2);
         assert_eq!(output.response_id, "resp-compact");
         assert_eq!(
             output.token_usage,
@@ -912,5 +961,104 @@ mod tests {
                 total_tokens: 123_498,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn collect_compaction_output_rejects_too_many_auxiliary_items() {
+        let mut events = (0..=MAX_REMOTE_COMPACTION_V2_AUXILIARY_ITEMS)
+            .map(|index| {
+                Ok(ResponseEvent::OutputItemDone(message(
+                    "assistant",
+                    &format!("auxiliary-{index}"),
+                    Some(MessagePhase::FinalAnswer),
+                )))
+            })
+            .collect::<Vec<_>>();
+        events.push(Ok(ResponseEvent::OutputItemDone(
+            ResponseItem::Compaction {
+                id: None,
+                encrypted_content: "encrypted".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        )));
+        events.push(Ok(ResponseEvent::Completed {
+            response_id: "resp-compact".to_string(),
+            token_usage: None,
+            end_turn: Some(true),
+        }));
+
+        let error = collect_compaction_output(response_stream(events))
+            .await
+            .err()
+            .expect("excess auxiliary items should fail compaction collection");
+
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::Fatal(message)
+                if message.contains(&format!(
+                    "{MAX_REMOTE_COMPACTION_V2_AUXILIARY_ITEMS}-item limit"
+                ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn collect_compaction_output_rejects_oversized_auxiliary_output() {
+        let oversized_message = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "x".repeat(MAX_REMOTE_COMPACTION_V2_AUXILIARY_BYTES + 1),
+            }],
+            phase: Some(MessagePhase::FinalAnswer),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let stream = response_stream(vec![Ok(ResponseEvent::OutputItemDone(oversized_message))]);
+
+        let error = collect_compaction_output(stream)
+            .await
+            .err()
+            .expect("oversized auxiliary output should fail compaction collection");
+
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::Fatal(message)
+                if message.contains(&format!(
+                    "{MAX_REMOTE_COMPACTION_V2_AUXILIARY_BYTES}-byte limit"
+                ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn collect_compaction_output_exempts_large_compaction_item_from_auxiliary_byte_limit() {
+        let oversized_compaction_bytes = MAX_REMOTE_COMPACTION_V2_AUXILIARY_BYTES + 1;
+        let stream = response_stream(vec![
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Compaction {
+                id: None,
+                encrypted_content: "x".repeat(oversized_compaction_bytes),
+                internal_chat_message_metadata_passthrough: None,
+            })),
+            Ok(ResponseEvent::Completed {
+                response_id: "resp-large-compaction".to_string(),
+                token_usage: None,
+                end_turn: Some(true),
+            }),
+        ]);
+
+        let output = collect_compaction_output(stream)
+            .await
+            .expect("large compaction item should not count against the auxiliary byte limit");
+
+        let [
+            ResponseItem::Compaction {
+                encrypted_content, ..
+            },
+        ] = output.output_items.as_slice()
+        else {
+            panic!("expected the large compaction item to be retained");
+        };
+        assert_eq!(encrypted_content.len(), oversized_compaction_bytes);
+        assert_eq!(output.compaction_index, 0);
+        assert_eq!(output.response_id, "resp-large-compaction");
+        assert_eq!(output.token_usage, None);
     }
 }

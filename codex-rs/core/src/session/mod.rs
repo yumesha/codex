@@ -3299,7 +3299,11 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
-    async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
+    pub(crate) async fn send_raw_response_items(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) {
         for item in items {
             self.send_event(
                 turn_context,
