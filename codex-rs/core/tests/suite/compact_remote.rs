@@ -1,5 +1,9 @@
 use core_test_support::test_codex::local_selections;
 use std::fs;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use base64::Engine;
@@ -57,7 +61,11 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use tokio::time::Duration;
+use wiremock::Mock;
+use wiremock::Respond;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
@@ -342,6 +350,38 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
         REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT,
     )
     .await;
+}
+
+async fn submit_text(codex: &codex_core::CodexThread, text: &str) -> Result<()> {
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    Ok(())
+}
+
+fn user_message_input_texts(body: &Value) -> Vec<&str> {
+    body.get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|content| content.get("type").and_then(Value::as_str) == Some("input_text"))
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1048,6 +1088,188 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
     assert!(
         follow_up_body.contains("hello remote compact"),
         "expected v2 follow-up request to preserve retained original user messages"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_bounds_a_tokenizer_dense_retained_suffix() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    #[derive(Debug)]
+    struct DenseUsageSequenceResponder {
+        num_calls: AtomicUsize,
+        responses: Vec<Option<String>>,
+        captured_bodies: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Respond for DenseUsageSequenceResponder {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
+            let body: Value = serde_json::from_slice(&request.body)
+                .expect("dense retention test request should be uncompressed JSON");
+            self.captured_bodies
+                .lock()
+                .expect("captured request lock poisoned")
+                .push(body.clone());
+            let response = if call_num == 4 {
+                let retained_and_current_text_bytes = user_message_input_texts(&body)
+                    .into_iter()
+                    .map(str::len)
+                    .sum::<usize>();
+                let dense_token_usage = 50_000i64.saturating_add(
+                    i64::try_from(retained_and_current_text_bytes).unwrap_or(i64::MAX),
+                );
+                responses::sse(vec![
+                    responses::ev_assistant_message("m4", "NEXT_REPLY"),
+                    responses::ev_completed_with_tokens("resp-4", dense_token_usage),
+                ])
+            } else {
+                self.responses
+                    .get(call_num)
+                    .and_then(Clone::clone)
+                    .unwrap_or_else(|| panic!("missing response for request {call_num}"))
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(response)
+        }
+    }
+
+    let harness = TestCodexHarness::with_auto_env_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config
+                    .features
+                    .disable(Feature::EnableRequestCompression)
+                    .expect("test config should allow request compression override");
+                config.model_context_window = Some(258_400);
+                config.model_auto_compact_token_limit = Some(230_000);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let ordinary_input = format!(
+        "ORDINARY_HISTORY_START {} ORDINARY_HISTORY_END",
+        "ordinary prose ".repeat(2_000)
+    );
+    let dense_input = format!("ARC_DENSE_START{}ARC_DENSE_END", "0,".repeat(40_000));
+    let after_compact_input = "AFTER_BOUNDED_COMPACT";
+    let next_input = format!(
+        "NEXT_ARC_DENSE_START{}NEXT_ARC_DENSE_END",
+        "1,".repeat(44_000)
+    );
+    let post_dense_probe = "POST_DENSE_PROBE";
+
+    let captured_bodies = Arc::new(Mutex::new(Vec::new()));
+    let responder = DenseUsageSequenceResponder {
+        num_calls: AtomicUsize::new(0),
+        responses: vec![
+            Some(responses::sse(vec![
+                responses::ev_assistant_message("m1", "FIRST_REMOTE_REPLY"),
+                responses::ev_completed_with_tokens("resp-1", /*total_tokens*/ 100),
+            ])),
+            Some(responses::sse(vec![
+                responses::ev_assistant_message("m2", "DENSE_REMOTE_REPLY"),
+                responses::ev_completed_with_tokens("resp-2", /*total_tokens*/ 100),
+            ])),
+            Some(responses::sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "BOUNDED_COMPACTION_SUMMARY",
+                    }
+                }),
+                responses::ev_completed("resp-compact"),
+            ])),
+            Some(responses::sse(vec![
+                responses::ev_assistant_message("m3", "AFTER_COMPACT_REPLY"),
+                responses::ev_completed_with_tokens("resp-3", /*total_tokens*/ 153_000),
+            ])),
+            None,
+            Some(responses::sse(vec![
+                responses::ev_assistant_message("m5", "PROBE_REPLY"),
+                responses::ev_completed("resp-5"),
+            ])),
+        ],
+        captured_bodies: Arc::clone(&captured_bodies),
+    };
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(responder)
+        .expect(6)
+        .mount(harness.server())
+        .await;
+
+    submit_text(&codex, &ordinary_input).await?;
+    wait_for_turn_complete(&codex).await;
+    submit_text(&codex, &dense_input).await?;
+    wait_for_turn_complete(&codex).await;
+    codex.submit(Op::Compact).await?;
+    wait_for_turn_complete(&codex).await;
+    submit_text(&codex, after_compact_input).await?;
+    wait_for_turn_complete(&codex).await;
+    submit_text(&codex, &next_input).await?;
+    wait_for_turn_complete(&codex).await;
+    submit_text(&codex, post_dense_probe).await?;
+    wait_for_turn_complete(&codex).await;
+
+    let requests = captured_bodies
+        .lock()
+        .expect("captured request lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 6);
+    let retained_user_texts = user_message_input_texts(&requests[3]);
+    let retained_dense_input = retained_user_texts
+        .iter()
+        .find(|text| text.contains("ARC_DENSE_START"))
+        .expect("follow-up request should retain a bounded part of the dense input");
+    assert!(retained_dense_input.len() <= 10_000);
+    assert!(retained_dense_input.contains("ARC_DENSE_END"));
+    let retained_ordinary_input = retained_user_texts
+        .iter()
+        .find(|text| text.contains("ORDINARY_HISTORY_START"))
+        .expect("aggregate retention should preserve more than the newest message");
+    assert!(retained_ordinary_input.len() <= 10_000);
+    assert!(retained_ordinary_input.contains("ORDINARY_HISTORY_END"));
+    assert_eq!(
+        retained_user_texts
+            .iter()
+            .filter(|text| **text == after_compact_input)
+            .count(),
+        1,
+    );
+    let next_body = &requests[4];
+    assert!(
+        !next_body
+            .to_string()
+            .contains("\"type\":\"compaction_trigger\""),
+        "the turn after bounded retention should not compact again"
+    );
+    assert_eq!(
+        user_message_input_texts(next_body)
+            .iter()
+            .filter(|text| **text == next_input)
+            .count(),
+        1,
+    );
+    let post_dense_body = &requests[5];
+    assert!(
+        !post_dense_body
+            .to_string()
+            .contains("\"type\":\"compaction_trigger\""),
+        "bounded retention should leave enough headroom to avoid immediate recompaction"
+    );
+    assert_eq!(
+        user_message_input_texts(post_dense_body)
+            .iter()
+            .filter(|text| **text == post_dense_probe)
+            .count(),
+        1,
     );
 
     Ok(())

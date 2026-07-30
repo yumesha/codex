@@ -37,12 +37,9 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::truncate_text;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -51,9 +48,13 @@ mod attempt;
 use attempt::RemoteCompactV2Attempt;
 use attempt::run_remote_compact_v2_attempt;
 
-// Mirror the current /responses/compact retained-message default while the
-// server-side path remains the reference implementation.
-const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
+#[path = "compact_remote_v2_retention.rs"]
+mod retention;
+use retention::RETAINED_MESSAGE_ITEM_TOKEN_BUDGET;
+use retention::RETAINED_MESSAGE_TOKEN_BUDGET;
+use retention::retained_message_token_upper_bound;
+use retention::truncate_message_to_retention_budget;
+
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
@@ -486,94 +487,28 @@ fn truncate_retained_messages_for_remote_compaction(
             continue;
         }
 
-        let token_count = message_text_token_count(&item).max(1);
-        if token_count <= remaining {
+        let item_budget = remaining.min(RETAINED_MESSAGE_ITEM_TOKEN_BUDGET);
+        let token_count = retained_message_token_upper_bound(&item).max(1);
+        if token_count <= item_budget {
             truncated_reversed.push(item);
             remaining = remaining.saturating_sub(token_count);
         } else if let Some(truncated_item) =
-            truncate_message_text_to_token_budget(item, /*max_tokens*/ remaining)
+            truncate_message_to_retention_budget(item, /*max_tokens*/ item_budget)
         {
+            let truncated_token_count = retained_message_token_upper_bound(&truncated_item).max(1);
             truncated_reversed.push(truncated_item);
-            remaining = 0;
+            remaining = remaining.saturating_sub(truncated_token_count);
         }
     }
     truncated_reversed.reverse();
     truncated_reversed
 }
 
-fn message_text_token_count(item: &ResponseItem) -> usize {
-    let ResponseItem::Message { content, .. } = item else {
-        return 0;
-    };
-
-    content
-        .iter()
-        .map(|item| match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                approx_token_count(text)
-            }
-            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => 0,
-        })
-        .sum()
-}
-
-fn truncate_message_text_to_token_budget(
-    item: ResponseItem,
-    max_tokens: usize,
-) -> Option<ResponseItem> {
-    let ResponseItem::Message {
-        id,
-        role,
-        content,
-        phase,
-        internal_chat_message_metadata_passthrough: metadata,
-    } = item
-    else {
-        return Some(item);
-    };
-
-    let mut remaining = max_tokens;
-    let mut truncated_content = Vec::with_capacity(content.len());
-    for mut content_item in content {
-        match &mut content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                if remaining == 0 {
-                    continue;
-                }
-
-                let token_count = approx_token_count(text);
-                if token_count <= remaining {
-                    remaining = remaining.saturating_sub(token_count);
-                } else {
-                    *text = truncate_text(text, TruncationPolicy::Tokens(remaining));
-                    remaining = 0;
-                }
-                if !text.is_empty() {
-                    truncated_content.push(content_item);
-                }
-            }
-            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => {
-                truncated_content.push(content_item);
-            }
-        }
-    }
-
-    if truncated_content.is_empty() {
-        return None;
-    }
-
-    Some(ResponseItem::Message {
-        id,
-        role,
-        content: truncated_content,
-        phase,
-        internal_chat_message_metadata_passthrough: metadata,
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::retention::retained_message_non_text_token_upper_bound;
     use super::*;
+    use crate::context_manager::estimate_item_token_count;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::MessagePhase;
     use pretty_assertions::assert_eq;
@@ -671,25 +606,24 @@ mod tests {
 
     #[test]
     fn build_v2_compacted_history_counts_retained_input_images() {
-        let input = vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![
-                ContentItem::InputText {
-                    text: "user".to_string(),
-                },
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
-                    detail: None,
-                },
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,def".to_string(),
-                    detail: None,
-                },
-            ],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }];
+        let input = ["abc", "def"]
+            .into_iter()
+            .map(|payload| ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputText {
+                        text: "user".to_string(),
+                    },
+                    ContentItem::InputImage {
+                        image_url: format!("data:image/png;base64,{payload}"),
+                        detail: None,
+                    },
+                ],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })
+            .collect::<Vec<_>>();
         let output = ResponseItem::Compaction {
             id: None,
             encrypted_content: "new".to_string(),
@@ -703,70 +637,79 @@ mod tests {
 
     #[test]
     fn retained_history_truncation_keeps_newest_messages_first() {
-        let middle = message("user", "middle1234", /*phase*/ None);
+        let middle = message(
+            "user",
+            &format!("middle{}1234", "x".repeat(1_000)),
+            /*phase*/ None,
+        );
         let new = message("user", "new", /*phase*/ None);
         let retained = vec![
-            message("user", "old-old", /*phase*/ None),
+            message("user", &"old".repeat(1_000), /*phase*/ None),
             middle,
             new.clone(),
         ];
+        let max_tokens = retained_message_token_upper_bound(&new).saturating_add(256);
 
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 3);
+        let truncated = truncate_retained_messages_for_remote_compaction(retained, max_tokens);
 
-        assert_eq!(
-            truncated,
-            vec![
-                message("user", "midd…1 tokens truncated…1234", /*phase*/ None),
-                new,
-            ]
+        assert_eq!(truncated.len(), 2);
+        assert_eq!(truncated.last(), Some(&new));
+        let ResponseItem::Message { content, .. } = &truncated[0] else {
+            panic!("retained history should contain a message");
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("truncated message should contain one text part");
+        };
+        assert!(text.starts_with("middle"));
+        assert!(text.ends_with("1234"));
+        assert!(
+            truncated
+                .iter()
+                .map(retained_message_token_upper_bound)
+                .sum::<usize>()
+                <= max_tokens
         );
     }
 
     #[test]
-    fn retained_history_truncation_preserves_images_and_truncates_later_text_parts() {
+    fn retained_history_truncation_preserves_images_and_bounds_text_parts() {
         let item = ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![
                 ContentItem::InputText {
-                    text: "abcdef".to_string(),
+                    text: "abcdef".repeat(100),
                 },
                 ContentItem::InputImage {
                     image_url: "data:image/png;base64,abc".to_string(),
                     detail: None,
                 },
                 ContentItem::OutputText {
-                    text: "uvwxyz".to_string(),
+                    text: "uvwxyz".repeat(100),
                 },
             ],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
+        let max_tokens = retained_message_non_text_token_upper_bound(&item).saturating_add(256);
 
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(vec![item], /*max_tokens*/ 3);
+        let truncated = truncate_retained_messages_for_remote_compaction(vec![item], max_tokens);
 
-        assert_eq!(
-            truncated,
-            vec![ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![
-                    ContentItem::InputText {
-                        text: "abcdef".to_string(),
-                    },
-                    ContentItem::InputImage {
-                        image_url: "data:image/png;base64,abc".to_string(),
-                        detail: None,
-                    },
-                    ContentItem::OutputText {
-                        text: "uv…1 tokens truncated…yz".to_string(),
-                    },
-                ],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }]
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(retained_input_image_count(&truncated[0]), 1);
+        assert!(retained_message_token_upper_bound(&truncated[0]) <= max_tokens);
+        let ResponseItem::Message { content, .. } = &truncated[0] else {
+            panic!("retained history should contain a message");
+        };
+        assert!(content.iter().any(|item| matches!(
+            item,
+            ContentItem::InputText { text }
+                if text.starts_with("abcdef") && text.ends_with("abcdef")
+        )));
+        assert!(
+            content
+                .iter()
+                .all(|item| !matches!(item, ContentItem::OutputText { .. }))
         );
     }
 
@@ -788,9 +731,18 @@ mod tests {
             image_only_message.clone(),
             newest.clone(),
         ];
+        let max_tokens = retained_message_token_upper_bound(&image_only_message)
+            .saturating_add(retained_message_token_upper_bound(&newest));
 
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 2);
+        assert_eq!(
+            retained_message_token_upper_bound(&image_only_message),
+            usize::try_from(estimate_item_token_count(&image_only_message).max(0))
+                .unwrap_or(usize::MAX)
+                .saturating_mul(4),
+            "all modeled non-text bytes must receive the conservative retained-item multiplier",
+        );
+
+        let truncated = truncate_retained_messages_for_remote_compaction(retained, max_tokens);
 
         assert_eq!(truncated, vec![image_only_message, newest]);
     }
@@ -809,11 +761,110 @@ mod tests {
         };
         let newest = message("user", "new", /*phase*/ None);
         let retained = vec![image_only_message, newest.clone()];
+        let max_tokens = retained_message_token_upper_bound(&newest);
 
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 1);
+        let truncated = truncate_retained_messages_for_remote_compaction(retained, max_tokens);
 
         assert_eq!(truncated, vec![newest]);
+    }
+
+    #[test]
+    fn retained_history_truncation_drops_remote_media_with_unknown_cost() {
+        let remote_image = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "https://example.com/large-image.png".to_string(),
+                detail: None,
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let remote_audio = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputAudio {
+                audio_url: "https://example.com/long-audio.wav".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let newest = message("user", "new", /*phase*/ None);
+
+        let truncated = truncate_retained_messages_for_remote_compaction(
+            vec![remote_image, remote_audio, newest.clone()],
+            RETAINED_MESSAGE_TOKEN_BUDGET,
+        );
+
+        assert_eq!(truncated, vec![newest]);
+    }
+
+    #[test]
+    fn retained_history_truncation_handles_text_part_boundaries() {
+        let item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "123456789012345".to_string(),
+                },
+                ContentItem::OutputText {
+                    text: "x".repeat(1_000),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let max_tokens = retained_message_non_text_token_upper_bound(&item).saturating_add(20);
+
+        let truncated = truncate_retained_messages_for_remote_compaction(vec![item], max_tokens);
+
+        assert_eq!(
+            truncated,
+            vec![message("user", "123456789012345", /*phase*/ None)]
+        );
+    }
+
+    #[test]
+    fn retained_history_truncation_caps_each_message_and_keeps_escaped_newest_text() {
+        let escaped_newest = message(
+            "user",
+            &format!("ESCAPED_START{}ESCAPED_END", "\0\\\"\n".repeat(10_000)),
+            /*phase*/ None,
+        );
+        let retained = vec![
+            message(
+                "user",
+                &"ordinary text ".repeat(10_000),
+                /*phase*/ None,
+            ),
+            escaped_newest,
+        ];
+
+        let truncated = truncate_retained_messages_for_remote_compaction(
+            retained,
+            RETAINED_MESSAGE_TOKEN_BUDGET,
+        );
+
+        assert_eq!(truncated.len(), 2);
+        assert!(truncated.iter().all(|item| {
+            retained_message_token_upper_bound(item) <= RETAINED_MESSAGE_ITEM_TOKEN_BUDGET
+        }));
+        assert!(
+            truncated
+                .iter()
+                .map(retained_message_token_upper_bound)
+                .sum::<usize>()
+                <= RETAINED_MESSAGE_TOKEN_BUDGET
+        );
+        let ResponseItem::Message { content, .. } = &truncated[1] else {
+            panic!("newest retained item should remain a message");
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("newest retained message should contain text");
+        };
+        assert!(text.starts_with("ESCAPED_START"));
+        assert!(text.ends_with("ESCAPED_END"));
     }
 
     #[tokio::test]
